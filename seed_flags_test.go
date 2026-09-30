@@ -61,7 +61,7 @@ func TestSeederBroadcastsHave(t *testing.T) {
 	state.mark_done(0)
 	st := &stats{}
 
-	s, err := start_seeder(0, tf, store, state, st, [20]byte{})
+	s, err := start_seeder(0, tf, store, state, st, [20]byte{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

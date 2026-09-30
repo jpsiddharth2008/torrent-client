@@ -14,7 +14,8 @@ type client struct {
 	peer_id   [20]byte
 	bitfield  bitfield
 	choked    bool
-	stats     *stats // optional; receives per-block byte counts
+	stats     *stats        // optional; receives per-block byte counts
+	down_lim  *rate_limiter // optional; nil means unlimited
 }
 
 func new_client(p peer, info_hash [20]byte, peer_id [20]byte, num_pieces int) (*client, error) {

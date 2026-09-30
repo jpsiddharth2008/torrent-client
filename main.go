@@ -19,12 +19,16 @@ func main() {
 	port := flag.Int("port", 6881, "TCP port to accept peer connections on, also announced to the tracker")
 	seed := flag.Bool("seed", false, "keep running after the download completes and upload to other peers until Ctrl+C")
 	peer_list := flag.String("peer", "", "connect only to these peers (host:port, comma-separated) instead of asking the tracker")
+	max_down := flag.Int("max-down", 0, "download speed limit in KB/s (0 = unlimited)")
+	max_up := flag.Int("max-up", 0, "upload speed limit in KB/s (0 = unlimited)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: %s [flags] <torrent file> <output file>\n\nflags:\n", os.Args[0])
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nexample, seed a finished file and download it again from it locally:\n"+
 			"  %[1]s --seed --port 6881 file.torrent file.iso\n"+
-			"  %[1]s --port 6882 --peer 127.0.0.1:6881 file.torrent copy.iso\n", os.Args[0])
+			"  %[1]s --port 6882 --peer 127.0.0.1:6881 file.torrent copy.iso\n"+
+			"\nthrottle the copy to 2 MB/s:\n"+
+			"  %[1]s --port 6882 --peer 127.0.0.1:6881 --max-down 2048 file.torrent copy.iso\n", os.Args[0])
 	}
 	flag.Parse()
 	if flag.NArg() != 2 {
@@ -35,6 +39,15 @@ func main() {
 		fmt.Fprintf(os.Stderr, "--port must be between 1 and 65535\n")
 		os.Exit(1)
 	}
+	if *max_down < 0 || *max_up < 0 {
+		fmt.Fprintf(os.Stderr, "--max-down and --max-up cannot be negative\n")
+		os.Exit(1)
+	}
+
+	// flags are KB/s because that is how people think about bandwidth; every
+	// limiter below works in bytes per second
+	down_lim := new_rate_limiter(*max_down * 1024)
+	up_lim := new_rate_limiter(*max_up * 1024)
 
 	var fixed_peers []peer
 	if *peer_list != "" {
@@ -94,7 +107,7 @@ func main() {
 	}
 
 	// serve verified pieces to other peers while we download (issue #9)
-	seeder, err := start_seeder(*port, &tf, store, state, st, peer_id)
+	seeder, err := start_seeder(*port, &tf, store, state, st, peer_id, up_lim)
 	if err != nil {
 		log.Printf("seeding disabled, could not start listener: %v\n", err)
 		if *seed {
@@ -109,6 +122,8 @@ func main() {
 	var ui *dashboard
 	if use_ui {
 		ui = new_dashboard(&tf, state, st, os.Stdout)
+		ui.down_lim, ui.up_lim = down_lim, up_lim
+		ui.pal = new_palette(colour_enabled(true)) // use_ui already proved stdout is a console
 		ui.start()
 	}
 	stop_ui := func() {
@@ -144,7 +159,7 @@ func main() {
 		}
 	}
 
-	opts := download_options{peer_id: peer_id, port: uint16(*port), peers: fixed_peers}
+	opts := download_options{peer_id: peer_id, port: uint16(*port), peers: fixed_peers, down_lim: down_lim}
 	if err := tf.download(store, state, st, opts, on_piece); err != nil {
 		stop_ui()
 		saver.flush()

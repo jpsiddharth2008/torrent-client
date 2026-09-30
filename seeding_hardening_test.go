@@ -129,7 +129,7 @@ func TestSeederRejectsWrongProtocol(t *testing.T) {
 
 func TestSeederStopClosesIdlePeers(t *testing.T) {
 	tf, store, state := seed_fixture(t, true)
-	s, err := start_seeder(0, tf, store, state, &stats{}, [20]byte{})
+	s, err := start_seeder(0, tf, store, state, &stats{}, [20]byte{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -51,3 +51,34 @@ go build -o torrent-client .
 ./torrent-client sample.torrent output.bin
 
 ```
+
+### Flags
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--port` | 6881 | TCP port for incoming peers, also announced to the tracker |
+| `--seed` | off | Keep running after the download finishes and upload to peers |
+| `--peer` | — | Connect only to these `host:port` peers instead of asking the tracker |
+| `--max-down` | 0 | Download limit in KB/s (0 = unlimited) |
+| `--max-up` | 0 | Upload limit in KB/s (0 = unlimited) |
+| `--no-ui` | off | Print log lines instead of the live dashboard |
+
+The dashboard is coloured when stdout is a terminal. It respects the
+[`NO_COLOR`](https://no-color.org) convention and switches itself off for
+`TERM=dumb` or redirected output.
+
+### Trying it locally
+
+Two instances on one machine, one seeding and one downloading from it, is
+enough to exercise the whole protocol without a tracker:
+
+```bash
+# terminal 1 — seed a file you already have
+./torrent-client --seed --port 6881 demo.torrent original.bin
+
+# terminal 2 — download it back, throttled so the dashboard is readable
+./torrent-client --port 6882 --peer 127.0.0.1:6881 --max-down 2048 demo.torrent copy.bin
+```
+
+Interrupt the second one with Ctrl+C and run it again to watch it resume:
+it rechecks the pieces already on disk and fetches only what is missing.

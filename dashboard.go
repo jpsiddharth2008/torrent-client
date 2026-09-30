@@ -46,6 +46,15 @@ func format_duration(d time.Duration) string {
 	return fmt.Sprintf("%02dm:%02ds", m, s)
 }
 
+// format_cap renders the limiter's ceiling for display, or nothing at all when
+// the direction is unlimited.
+func format_cap(r *rate_limiter) string {
+	if r.limit() == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (capped %s/s)", format_bytes(r.limit()))
+}
+
 func make_progress_bar(pct float64, width int) string {
 	completed := int(pct * float64(width))
 	if completed > width {
@@ -97,6 +106,12 @@ type dashboard struct {
 	state *piece_state
 	st    *stats
 	out   io.Writer
+
+	// optional; when set the configured cap is shown beside the live speed
+	down_lim *rate_limiter
+	up_lim   *rate_limiter
+
+	pal palette // zero value renders without colour
 
 	down_speed float64 // smoothed bytes/s
 	up_speed   float64
@@ -167,27 +182,62 @@ func (d *dashboard) render(now time.Time) string {
 		eta = format_duration(time.Duration(float64(left)/d.down_speed) * time.Second)
 	}
 
+	p := d.pal
 	var b strings.Builder
 	line := func(format string, args ...any) {
 		fmt.Fprintf(&b, format, args...)
 		b.WriteString("\033[K\n") // clear what's left of the previous frame's line
 	}
+	// labels are recessive so the eye lands on the figures, not the chrome
+	label := func(s string) string { return p.paint(p.muted, s) }
 
-	line(" %s", d.t.name)
-	line(" %s  %5.1f%%   %d/%d pieces", make_progress_bar(pct, bar_width), pct*100, done_pieces, num_pieces)
+	// header: what is being transferred, and its state, on one line
+	line(" %s   %s",
+		p.paint(p.heading, d.t.name),
+		p.paint(p.status_token(status), status))
+	line(" %s", p.paint(p.muted, strings.Repeat("─", bar_width+24)))
+
+	// the headline figure: bar, percentage and piece count together
+	line(" %s  %s   %s",
+		p.colour_bar(make_progress_bar(pct, bar_width), p.success),
+		p.paint(p.bold, fmt.Sprintf("%5.1f%%", pct*100)),
+		p.paint(p.accent, fmt.Sprintf("%d/%d pieces", done_pieces, num_pieces)))
 	line("")
-	line(" Status      %s", status)
-	line(" Downloaded  %s / %s   (%s this session)", format_bytes(done_bytes), format_bytes(int64(d.t.length)), format_bytes(d.st.downloaded.Load()))
-	line(" Uploaded    %s   (%d peers downloading from us)", format_bytes(d.st.uploaded.Load()), d.st.upload_peers.Load())
-	line(" Speed       ↓ %s/s   ↑ %s/s", format_bytes(int64(d.down_speed)), format_bytes(int64(d.up_speed)))
-	line(" ETA         %s", eta)
-	line(" Workers     %d active   (%d peers known)", d.st.active_peers.Load(), d.st.known_peers.Load())
-	line(" Elapsed     %s", format_duration(now.Sub(d.st.started)))
+
+	// transfer rates, the numbers that move every frame, paired with the
+	// two time figures so the whole "how fast, how long" story is one block
+	line(" %s %s%s      %s %s",
+		p.paint(p.success, "↓"),
+		p.paint(p.bold, format_bytes(int64(d.down_speed))+"/s"),
+		label(format_cap(d.down_lim)),
+		label("ETA     "), p.paint(p.accent, eta))
+	line(" %s %s%s      %s %s",
+		p.paint(p.accent, "↑"),
+		p.paint(p.bold, format_bytes(int64(d.up_speed))+"/s"),
+		label(format_cap(d.up_lim)),
+		label("Elapsed "), format_duration(now.Sub(d.st.started)))
 	line("")
-	line(" Pieces      %s", make_piece_map(d.state.snapshot(), num_pieces, piece_map_width))
-	line("             █ done  ▒ partly done  ░ missing")
+
+	// totals and connection counts, the slower-moving context
+	line(" %s %s %s %s   %s",
+		label("Downloaded"), format_bytes(done_bytes),
+		label("/"), format_bytes(int64(d.t.length)),
+		label(fmt.Sprintf("(%s this session)", format_bytes(d.st.downloaded.Load()))))
+	line(" %s %s   %s",
+		label("Uploaded  "), format_bytes(d.st.uploaded.Load()),
+		label(fmt.Sprintf("(%d peers downloading from us)", d.st.upload_peers.Load())))
+	line(" %s %s   %s",
+		label("Workers   "), p.paint(p.accent, fmt.Sprintf("%d active", d.st.active_peers.Load())),
+		label(fmt.Sprintf("(%d peers known)", d.st.known_peers.Load())))
 	line("")
-	line(" Ctrl+C to stop (progress is saved)")
+
+	line(" %s %s", label("Pieces    "), p.colour_piece_map(make_piece_map(d.state.snapshot(), num_pieces, piece_map_width)))
+	line("            %s %s  %s %s  %s %s",
+		p.paint(p.success, "█"), label("done"),
+		p.paint(p.warning, "▒"), label("partial"),
+		p.paint(p.muted, "░"), label("missing"))
+	line("")
+	line(" %s", label("Ctrl+C to stop — progress is saved"))
 	return b.String()
 }
 
