@@ -88,6 +88,10 @@ func (pp *piece_progress) handle_message(c *client) error {
 		if c.stats != nil {
 			c.stats.downloaded.Add(int64(n))
 		}
+		// throttle after the block is banked, not before: the bytes are
+		// already on the wire, and sleeping here delays the next request,
+		// which is what actually paces the peer
+		c.down_lim.wait(n)
 	}
 
 	return nil
@@ -124,7 +128,7 @@ func check_integrity(pw *piece_work, data []byte) error {
 	return nil
 }
 
-func start_download_worker(p peer, info_hash [20]byte, peer_id [20]byte, num_pieces int, st *stats, work_ch chan *piece_work, results_ch chan *piece_result) {
+func start_download_worker(p peer, info_hash [20]byte, peer_id [20]byte, num_pieces int, st *stats, down_lim *rate_limiter, work_ch chan *piece_work, results_ch chan *piece_result) {
 	// num_pieces is passed explicitly: len(work_ch) shrinks as work is claimed,
 	// which would undersize the bitfield of any late-connecting peer
 	c, err := new_client(p, info_hash, peer_id, num_pieces)
@@ -135,6 +139,9 @@ func start_download_worker(p peer, info_hash [20]byte, peer_id [20]byte, num_pie
 	defer c.conn.Close()
 
 	c.stats = st
+	// one limiter shared by every worker, so the cap is a total across peers
+	// rather than a per-peer allowance
+	c.down_lim = down_lim
 	st.active_peers.Add(1)
 	defer st.active_peers.Add(-1)
 
@@ -184,9 +191,10 @@ func start_download_worker(p peer, info_hash [20]byte, peer_id [20]byte, num_pie
 // download_options configures where download finds peers and how it
 // identifies itself to them.
 type download_options struct {
-	peer_id [20]byte
-	port    uint16 // our listening port, announced to the tracker
-	peers   []peer // if set, connect only to these and never ask the tracker
+	peer_id  [20]byte
+	port     uint16        // our listening port, announced to the tracker
+	peers    []peer        // if set, connect only to these and never ask the tracker
+	down_lim *rate_limiter // shared across workers; nil means unlimited
 }
 
 // find_peers returns the fixed peer list if one was given, otherwise asks the
@@ -239,7 +247,7 @@ func (t *torrent_file) download(store *storage, state *piece_state, st *stats, o
 			running.Add(1)
 			go func(p peer) {
 				defer running.Add(-1)
-				start_download_worker(p, t.info_hash, peer_id, num_pieces, st, work_ch, results_ch)
+				start_download_worker(p, t.info_hash, peer_id, num_pieces, st, opts.down_lim, work_ch, results_ch)
 			}(p)
 		}
 	}

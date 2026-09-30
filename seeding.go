@@ -31,6 +31,7 @@ type seeder struct {
 	state    *piece_state
 	st       *stats
 	peer_id  [20]byte
+	up_lim   *rate_limiter // shared across peers; nil means unlimited
 	quit     chan struct{}
 	wg       sync.WaitGroup
 
@@ -60,7 +61,7 @@ func (p *seed_peer) send_locked(m *message) error {
 	return err
 }
 
-func start_seeder(port int, tf *torrent_file, store *storage, state *piece_state, st *stats, peer_id [20]byte) (*seeder, error) {
+func start_seeder(port int, tf *torrent_file, store *storage, state *piece_state, st *stats, peer_id [20]byte, up_lim *rate_limiter) (*seeder, error) {
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		return nil, fmt.Errorf("failed to listen on port %d: %w", port, err)
@@ -73,6 +74,7 @@ func start_seeder(port int, tf *torrent_file, store *storage, state *piece_state
 		state:    state,
 		st:       st,
 		peer_id:  peer_id,
+		up_lim:   up_lim,
 		quit:     make(chan struct{}),
 	}
 
@@ -276,6 +278,10 @@ func (s *seeder) handle_peer(conn net.Conn) {
 			binary.BigEndian.PutUint32(payload[0:4], uint32(index))
 			binary.BigEndian.PutUint32(payload[4:8], uint32(begin))
 			copy(payload[8:], block)
+
+			// paced before the write so the sleep throttles this peer's
+			// handler goroutine rather than letting the block hit the socket
+			s.up_lim.wait(len(block))
 
 			// counted before the write: a synchronous conn only returns once
 			// the peer has read the block
