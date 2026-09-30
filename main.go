@@ -3,6 +3,8 @@ package main
 import (
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 )
 
@@ -20,15 +22,21 @@ func main() {
 		log.Fatalf("could not open torrent file: %v\n", err)
 	}
 
-	// 2. Initialize disk-backed storage, piece state tracker, and atomic stats
+	// 2. Check existing file & restore state for resume support
+	_, stat_err := os.Stat(out_path)
+	existed := stat_err == nil
+
 	store, err := open_storage(out_path, tf.length, tf.piece_length)
 	if err != nil {
-		log.Fatalf("could not open storage: %v\n", err)
+		log.Fatalf("could not open output file: %v\n", err)
 	}
 	defer store.close()
 
 	pState := new_piece_state(len(tf.piece_hashes))
+	restore_progress(&tf, store, pState, out_path, existed)
+
 	st := &stats{started: time.Now()}
+	saver := new_resume_saver(state_path(out_path), &tf, store, pState)
 
 	// 3. Start live terminal progress dashboard in background (Issue #8)
 	stopDash := make(chan struct{})
@@ -43,12 +51,29 @@ func main() {
 		log.Println("Seeding TCP listener active on port 6881")
 	}
 
-	// 5. Run main download pipeline
-	_, err = tf.download()
-	close(stopDash) // Stop dashboard renderer when download completes or exits
+	// 5. Save progress on Ctrl+C signal
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-interrupt
+		log.Printf("interrupted, saving progress (%d/%d pieces)\n", pState.count(), len(tf.piece_hashes))
+		if err := saver.flush(); err != nil {
+			log.Printf("could not save resume state: %v\n", err)
+		}
+		os.Exit(130)
+	}()
 
-	if err != nil {
+	// 6. Run main download pipeline
+	if err := tf.download(store, pState, saver.piece_done); err != nil {
+		saver.flush()
+		close(stopDash)
 		log.Fatalf("download failed: %v\n", err)
+	}
+
+	close(stopDash)
+
+	if err := saver.flush(); err != nil {
+		log.Fatalf("could not save resume state: %v\n", err)
 	}
 
 	log.Println("Download completed successfully!")

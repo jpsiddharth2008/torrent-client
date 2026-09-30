@@ -124,7 +124,7 @@ func (p peer) String() string {
 	return fmt.Sprintf("%d.%d.%d.%d:%d", p.ip[0], p.ip[1], p.ip[2], p.ip[3], p.port)
 }
 
-func (t *torrent_file) request_peers(peer_id [20]byte, port uint16) ([]peer, error) {
+func (t *torrent_file) request_peers(peer_id [20]byte, port uint16, left int) ([]peer, error) {
 	base, err := url.Parse(t.announce)
 	if err != nil {
 		return nil, err
@@ -137,7 +137,7 @@ func (t *torrent_file) request_peers(peer_id [20]byte, port uint16) ([]peer, err
 		"uploaded":   []string{"0"},
 		"downloaded": []string{"0"},
 		"compact":    []string{"1"},
-		"left":       []string{strconv.Itoa(t.length)},
+		"left":       []string{strconv.Itoa(left)},
 		"numwant":    []string{"100"},
 	}
 
