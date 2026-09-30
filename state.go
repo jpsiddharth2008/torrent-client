@@ -58,5 +58,7 @@ type stats struct {
 	uploaded     atomic.Int64
 	active_peers atomic.Int32 // workers connected to a peer right now
 	known_peers  atomic.Int32 // peers in the latest tracker response
+	upload_peers atomic.Int32 // peers connected to our seeder
+	seeding      atomic.Bool  // download finished, staying up to upload (--seed)
 	started      time.Time
 }

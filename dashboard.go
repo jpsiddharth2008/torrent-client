@@ -155,6 +155,9 @@ func (d *dashboard) render(now time.Time) string {
 	status := "Downloading"
 	eta := "--"
 	switch {
+	case done_pieces == num_pieces && d.st.seeding.Load():
+		status = "Seeding (download complete, uploading to peers)"
+		eta = "done"
 	case done_pieces == num_pieces:
 		status = "Complete"
 		eta = "done"
@@ -175,9 +178,10 @@ func (d *dashboard) render(now time.Time) string {
 	line("")
 	line(" Status      %s", status)
 	line(" Downloaded  %s / %s   (%s this session)", format_bytes(done_bytes), format_bytes(int64(d.t.length)), format_bytes(d.st.downloaded.Load()))
+	line(" Uploaded    %s   (%d peers downloading from us)", format_bytes(d.st.uploaded.Load()), d.st.upload_peers.Load())
 	line(" Speed       ↓ %s/s   ↑ %s/s", format_bytes(int64(d.down_speed)), format_bytes(int64(d.up_speed)))
 	line(" ETA         %s", eta)
-	line(" Workers     %d active   (%d peers from tracker)", d.st.active_peers.Load(), d.st.known_peers.Load())
+	line(" Workers     %d active   (%d peers known)", d.st.active_peers.Load(), d.st.known_peers.Load())
 	line(" Elapsed     %s", format_duration(now.Sub(d.st.started)))
 	line("")
 	line(" Pieces      %s", make_piece_map(d.state.snapshot(), num_pieces, piece_map_width))
