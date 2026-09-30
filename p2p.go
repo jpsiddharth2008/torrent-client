@@ -5,12 +5,17 @@ import (
 	"crypto/sha1"
 	"fmt"
 	"log"
-	"runtime"
+	"sync/atomic"
 	"time"
 )
 
 const block_size = 16384
 const max_backlog = 5
+
+// how often the download loop checks whether any workers are still alive,
+// and the minimum gap between tracker announces when they are all gone
+const peer_check_interval = 5 * time.Second
+const reannounce_delay = 30 * time.Second
 
 type piece_work struct {
 	index  int
@@ -77,6 +82,12 @@ func (pp *piece_progress) handle_message(c *client) error {
 			return err
 		}
 		pp.downloaded += n
+		// the block landed, so free its slot for the next request
+		pp.backlog--
+		// counted per 16 KB block, not per piece, so the speed readout is smooth
+		if c.stats != nil {
+			c.stats.downloaded.Add(int64(n))
+		}
 	}
 
 	return nil
@@ -113,13 +124,19 @@ func check_integrity(pw *piece_work, data []byte) error {
 	return nil
 }
 
-func start_download_worker(p peer, info_hash [20]byte, peer_id [20]byte, work_ch chan *piece_work, results_ch chan *piece_result) {
-	c, err := new_client(p, info_hash, peer_id, len(work_ch))
+func start_download_worker(p peer, info_hash [20]byte, peer_id [20]byte, num_pieces int, st *stats, work_ch chan *piece_work, results_ch chan *piece_result) {
+	// num_pieces is passed explicitly: len(work_ch) shrinks as work is claimed,
+	// which would undersize the bitfield of any late-connecting peer
+	c, err := new_client(p, info_hash, peer_id, num_pieces)
 	if err != nil {
 		log.Printf("could not connect to peer %s: %v\n", p, err)
 		return
 	}
 	defer c.conn.Close()
+
+	c.stats = st
+	st.active_peers.Add(1)
+	defer st.active_peers.Add(-1)
 
 	log.Printf("connected to peer %s\n", p)
 
@@ -131,11 +148,21 @@ func start_download_worker(p peer, info_hash [20]byte, peer_id [20]byte, work_ch
 	}
 	log.Printf("sent interested to %s, choked=%v\n", p, c.choked)
 
+	misses := 0
 	for pw := range work_ch {
 		if !c.bitfield.has_piece(pw.index) {
 			work_ch <- pw
+			// once we have cycled through the whole queue without finding a
+			// piece this peer has, it has nothing we need: give up rather
+			// than spin on the channel at full CPU
+			misses++
+			if misses > len(work_ch) {
+				log.Printf("peer %s has none of the pieces we still need\n", p)
+				return
+			}
 			continue
 		}
+		misses = 0
 
 		data, err := download_piece(c, pw)
 		if err != nil {
@@ -157,7 +184,7 @@ func start_download_worker(p peer, info_hash [20]byte, peer_id [20]byte, work_ch
 // download fetches every piece not already marked done in state, writing each
 // verified piece to store. on_piece, if set, runs after a piece is on disk
 // and marked done.
-func (t *torrent_file) download(store *storage, state *piece_state, on_piece func(index int)) error {
+func (t *torrent_file) download(store *storage, state *piece_state, st *stats, on_piece func(index int)) error {
 	num_pieces := len(t.piece_hashes)
 	done_pieces := state.count()
 	if done_pieces == num_pieces {
@@ -177,6 +204,7 @@ func (t *torrent_file) download(store *storage, state *piece_state, on_piece fun
 		return err
 	}
 	log.Printf("got %d peers from tracker\n", len(peers))
+	st.known_peers.Store(int32(len(peers)))
 
 	work_ch := make(chan *piece_work, num_pieces)
 	results_ch := make(chan *piece_result)
@@ -190,27 +218,59 @@ func (t *torrent_file) download(store *storage, state *piece_state, on_piece fun
 		work_ch <- &piece_work{index, hash, length}
 	}
 
-	for _, p := range peers {
-		go start_download_worker(p, t.info_hash, peer_id, work_ch, results_ch)
+	// running counts worker goroutines still alive, including ones still
+	// connecting; st.active_peers only counts those past the handshake
+	var running atomic.Int32
+	spawn := func(peers []peer) {
+		for _, p := range peers {
+			running.Add(1)
+			go func(p peer) {
+				defer running.Add(-1)
+				start_download_worker(p, t.info_hash, peer_id, num_pieces, st, work_ch, results_ch)
+			}(p)
+		}
 	}
+	spawn(peers)
+
+	check := time.NewTicker(peer_check_interval)
+	defer check.Stop()
+	last_announce := time.Now()
 
 	for done_pieces < num_pieces {
-		result := <-results_ch
+		select {
+		case result := <-results_ch:
+			if err := store.write_piece(result.index, result.data); err != nil {
+				return err
+			}
+			// mark done only once the data is written, so the saved state
+			// never claims a piece that is not on disk
+			state.mark_done(result.index)
+			if on_piece != nil {
+				on_piece(result.index)
+			}
+			done_pieces++
 
-		if err := store.write_piece(result.index, result.data); err != nil {
-			return err
-		}
-		// mark done only once the data is written, so the saved state
-		// never claims a piece that is not on disk
-		state.mark_done(result.index)
-		if on_piece != nil {
-			on_piece(result.index)
-		}
-		done_pieces++
+			percent := float64(done_pieces) / float64(num_pieces) * 100
+			log.Printf("%.2f%% done — piece %d downloaded, %d peers active\n", percent, result.index, st.active_peers.Load())
 
-		percent := float64(done_pieces) / float64(num_pieces) * 100
-		num_workers := runtime.NumGoroutine() - 1
-		log.Printf("%.2f%% done — piece %d downloaded, %d peers active\n", percent, result.index, num_workers)
+		case <-check.C:
+			// every worker has exited (peers disconnected, timed out or had
+			// nothing we need), so nothing will ever arrive on results_ch:
+			// ask the tracker for a fresh peer list instead of hanging
+			if running.Load() > 0 || time.Since(last_announce) < reannounce_delay {
+				continue
+			}
+			last_announce = time.Now()
+
+			peers, err := t.request_peers(peer_id, 6881, t.bytes_left(state))
+			if err != nil {
+				log.Printf("re-announce failed: %v\n", err)
+				continue
+			}
+			log.Printf("all peers gone, re-announced and got %d peers\n", len(peers))
+			st.known_peers.Store(int32(len(peers)))
+			spawn(peers)
+		}
 	}
 	// work_ch is deliberately left open: a worker may still hand back a piece
 	// it was holding, and a send on a closed channel would panic

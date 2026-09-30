@@ -38,27 +38,26 @@ type torrent_file struct {
 }
 
 func open(path string) (torrent_file, error) {
-	f, err := os.Open(path)
+	metainfo, err := os.ReadFile(path)
 	if err != nil {
 		return torrent_file{}, err
 	}
-	defer f.Close()
 
 	raw := &bencode_torrent{}
 
-	if err := bencode.Unmarshal(f, raw); err != nil {
+	if err := bencode.Unmarshal(bytes.NewReader(metainfo), raw); err != nil {
 		return torrent_file{}, err
 	}
 
-	return raw.to_torrent_file()
-}
-
-func (b *bencode_torrent) to_torrent_file() (torrent_file, error) {
-	info_hash, err := b.Info.hash()
+	info_hash, err := info_hash_of(metainfo)
 	if err != nil {
 		return torrent_file{}, err
 	}
 
+	return raw.to_torrent_file(info_hash)
+}
+
+func (b *bencode_torrent) to_torrent_file(info_hash [20]byte) (torrent_file, error) {
 	piece_hashes, err := b.Info.split_piece_hashes()
 	if err != nil {
 		return torrent_file{}, err
@@ -74,10 +73,32 @@ func (b *bencode_torrent) to_torrent_file() (torrent_file, error) {
 	}, nil
 }
 
-func (i *bencode_info) hash() ([20]byte, error) {
-	var buf bytes.Buffer
+// info_hash_of computes the SHA-1 of the torrent's info dictionary.
+//
+// The hash has to cover the info dictionary exactly as trackers and peers see
+// it, including keys this client does not model (private, files, source, ...).
+// Re-encoding bencode_info would drop those keys and yield an info hash nobody
+// else agrees with, so decode the metainfo generically and re-encode just the
+// info dictionary. bencode-go emits dictionary keys sorted, which is the
+// canonical ordering the spec requires.
+func info_hash_of(metainfo []byte) ([20]byte, error) {
+	decoded, err := bencode.Decode(bytes.NewReader(metainfo))
+	if err != nil {
+		return [20]byte{}, err
+	}
 
-	if err := bencode.Marshal(&buf, i); err != nil {
+	top, ok := decoded.(map[string]interface{})
+	if !ok {
+		return [20]byte{}, fmt.Errorf("malformed torrent: top level is not a dictionary")
+	}
+
+	info, ok := top["info"]
+	if !ok {
+		return [20]byte{}, fmt.Errorf("malformed torrent: missing info dictionary")
+	}
+
+	var buf bytes.Buffer
+	if err := bencode.Marshal(&buf, info); err != nil {
 		return [20]byte{}, err
 	}
 
@@ -150,17 +171,26 @@ func (t *torrent_file) request_peers(peer_id [20]byte, port uint16, left int) ([
 	}
 	defer response.Body.Close()
 
-	body, err := io.ReadAll(response.Body)
+	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 	if err != nil {
 		return nil, err
 	}
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("tracker returned HTTP %d", response.StatusCode)
+	}
 
 	var tracker_resp struct {
-		Peers string `bencode:"peers"`
+		Failure string `bencode:"failure reason"`
+		Peers   string `bencode:"peers"`
 	}
 
 	if err := bencode.Unmarshal(bytes.NewReader(body), &tracker_resp); err != nil {
 		return nil, err
+	}
+	// a tracker reports errors (unregistered torrent, rate limit, ...) as a
+	// normal response with this key; without the check it looks like 0 peers
+	if tracker_resp.Failure != "" {
+		return nil, fmt.Errorf("tracker error: %s", tracker_resp.Failure)
 	}
 	return unmarshal_peers([]byte(tracker_resp.Peers))
 }
