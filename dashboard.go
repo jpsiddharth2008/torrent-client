@@ -2,8 +2,19 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"strings"
+	"sync"
 	"time"
+)
+
+const (
+	dashboard_refresh = 500 * time.Millisecond
+	// weight of the newest sample in the smoothed speed; peers send data in
+	// bursts, so the raw per-tick rate jumps around too much to read
+	speed_smoothing = 0.3
+	bar_width       = 40
+	piece_map_width = 60
 )
 
 func format_bytes(b int64) string {
@@ -47,77 +58,168 @@ func make_progress_bar(pct float64, width int) string {
 	return fmt.Sprintf("[%s%s]", strings.Repeat("█", completed), strings.Repeat("░", remaining))
 }
 
-func render_ui(state *piece_state, st *stats, totalLength int64, speedBytesPerSec int64) {
-	fmt.Print("\033[H") // Move cursor to top-left corner
+// make_piece_map squeezes the have-bitfield into width cells: full when every
+// piece in the cell is done, shaded when some are, light when none are.
+func make_piece_map(have bitfield, num_pieces, width int) string {
+	if num_pieces <= 0 {
+		return ""
+	}
+	if width > num_pieces {
+		width = num_pieces
+	}
 
-	currentDownloaded := st.downloaded.Load()
-	numPieces := state.num_pieces
-	completedPieces := state.count()
-
-	pct := 0.0
-	if totalLength > 0 {
-		pct = float64(currentDownloaded) / float64(totalLength)
-		if pct > 1.0 {
-			pct = 1.0
+	var b strings.Builder
+	for cell := 0; cell < width; cell++ {
+		first := cell * num_pieces / width
+		last := (cell + 1) * num_pieces / width
+		done := 0
+		for i := first; i < last; i++ {
+			if have.has_piece(i) {
+				done++
+			}
+		}
+		switch {
+		case done == last-first:
+			b.WriteString("█")
+		case done > 0:
+			b.WriteString("▒")
+		default:
+			b.WriteString("░")
 		}
 	}
-
-	var etaStr string
-	if speedBytesPerSec > 0 && currentDownloaded < totalLength {
-		remBytes := totalLength - currentDownloaded
-		etaSec := time.Duration(remBytes/speedBytesPerSec) * time.Second
-		etaStr = format_duration(etaSec)
-	} else if currentDownloaded >= totalLength {
-		etaStr = "Complete"
-	} else {
-		etaStr = "Calculating..."
-	}
-
-	elapsed := format_duration(time.Since(st.started))
-	bar := make_progress_bar(pct, 30)
-
-	fmt.Println("==================================================")
-	fmt.Println("             BITTORRENT CLIENT DASHBOARD          ")
-	fmt.Println("==================================================")
-	fmt.Printf(" Progress:      %s %.1f%%\n", bar, pct*100)
-	fmt.Printf(" Pieces:        %d / %d completed\n", completedPieces, numPieces)
-	fmt.Printf(" Downloaded:    %s / %s\n", format_bytes(currentDownloaded), format_bytes(totalLength))
-	fmt.Printf(" Download Rate: %s/s\n", format_bytes(speedBytesPerSec))
-	fmt.Printf(" Active Peers:  %d\n", st.active_peers.Load())
-	fmt.Printf(" Elapsed Time:  %s\n", elapsed)
-	fmt.Printf(" ETA:           %s\n", etaStr)
-	fmt.Println("==================================================")
+	return b.String()
 }
 
-func run_dashboard(state *piece_state, st *stats, totalLength int64, stopChan <-chan struct{}) {
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
+// dashboard redraws a live status screen in the terminal from the shared
+// piece_state and stats, which the download goroutines update.
+type dashboard struct {
+	t     *torrent_file
+	state *piece_state
+	st    *stats
+	out   io.Writer
 
-	var lastDownloaded int64
-	lastTime := time.Now()
+	down_speed float64 // smoothed bytes/s
+	up_speed   float64
+	last_down  int64
+	last_up    int64
+	last_time  time.Time
+	sampled    bool
 
-	// Clear screen and hide cursor
-	fmt.Print("\033[?25l\033[2J")
-	defer fmt.Print("\033[?25h\n") // Restore cursor on exit
+	stop_once sync.Once
+	stop_ch   chan struct{}
+	done_ch   chan struct{}
+}
 
-	for {
-		select {
-		case <-stopChan:
-			render_ui(state, st, totalLength, 0)
-			return
-		case now := <-ticker.C:
-			downloaded := st.downloaded.Load()
-			elapsedSec := now.Sub(lastTime).Seconds()
+func new_dashboard(t *torrent_file, state *piece_state, st *stats, out io.Writer) *dashboard {
+	return &dashboard{
+		t:       t,
+		state:   state,
+		st:      st,
+		out:     out,
+		stop_ch: make(chan struct{}),
+		done_ch: make(chan struct{}),
+	}
+}
 
-			var speed int64
-			if elapsedSec > 0 {
-				speed = int64(float64(downloaded-lastDownloaded) / elapsedSec)
-			}
+// sample folds the bytes moved since the last call into the smoothed speeds.
+func (d *dashboard) sample(now time.Time) {
+	down := d.st.downloaded.Load()
+	up := d.st.uploaded.Load()
 
-			lastDownloaded = downloaded
-			lastTime = now
-
-			render_ui(state, st, totalLength, speed)
+	if d.sampled {
+		elapsed := now.Sub(d.last_time).Seconds()
+		if elapsed > 0 {
+			inst_down := float64(down-d.last_down) / elapsed
+			inst_up := float64(up-d.last_up) / elapsed
+			d.down_speed = speed_smoothing*inst_down + (1-speed_smoothing)*d.down_speed
+			d.up_speed = speed_smoothing*inst_up + (1-speed_smoothing)*d.up_speed
 		}
 	}
+
+	d.last_down, d.last_up, d.last_time, d.sampled = down, up, now, true
+}
+
+// render builds one full frame. Progress comes from verified pieces, not
+// bytes received this session, so a resumed download starts where it left off.
+func (d *dashboard) render(now time.Time) string {
+	num_pieces := len(d.t.piece_hashes)
+	done_pieces := d.state.count()
+	left := d.t.bytes_left(d.state)
+	done_bytes := int64(d.t.length - left)
+
+	pct := 0.0
+	if d.t.length > 0 {
+		pct = float64(done_bytes) / float64(d.t.length)
+	}
+
+	status := "Downloading"
+	eta := "--"
+	switch {
+	case done_pieces == num_pieces:
+		status = "Complete"
+		eta = "done"
+	case d.st.active_peers.Load() == 0:
+		status = "Waiting for peers"
+	case d.down_speed >= 1:
+		eta = format_duration(time.Duration(float64(left)/d.down_speed) * time.Second)
+	}
+
+	var b strings.Builder
+	line := func(format string, args ...any) {
+		fmt.Fprintf(&b, format, args...)
+		b.WriteString("\033[K\n") // clear what's left of the previous frame's line
+	}
+
+	line(" %s", d.t.name)
+	line(" %s  %5.1f%%   %d/%d pieces", make_progress_bar(pct, bar_width), pct*100, done_pieces, num_pieces)
+	line("")
+	line(" Status      %s", status)
+	line(" Downloaded  %s / %s   (%s this session)", format_bytes(done_bytes), format_bytes(int64(d.t.length)), format_bytes(d.st.downloaded.Load()))
+	line(" Speed       ↓ %s/s   ↑ %s/s", format_bytes(int64(d.down_speed)), format_bytes(int64(d.up_speed)))
+	line(" ETA         %s", eta)
+	line(" Workers     %d active   (%d peers from tracker)", d.st.active_peers.Load(), d.st.known_peers.Load())
+	line(" Elapsed     %s", format_duration(now.Sub(d.st.started)))
+	line("")
+	line(" Pieces      %s", make_piece_map(d.state.snapshot(), num_pieces, piece_map_width))
+	line("             █ done  ▒ partly done  ░ missing")
+	line("")
+	line(" Ctrl+C to stop (progress is saved)")
+	return b.String()
+}
+
+func (d *dashboard) draw(now time.Time) {
+	// cursor home, frame, then clear anything below it
+	fmt.Fprint(d.out, "\033[H"+d.render(now)+"\033[J")
+}
+
+// start clears the screen and redraws until stop is called.
+func (d *dashboard) start() {
+	fmt.Fprint(d.out, "\033[?25l\033[2J") // hide cursor, clear screen
+
+	go func() {
+		defer close(d.done_ch)
+		ticker := time.NewTicker(dashboard_refresh)
+		defer ticker.Stop()
+
+		d.sample(time.Now())
+		d.draw(time.Now())
+		for {
+			select {
+			case <-d.stop_ch:
+				d.draw(time.Now())
+				fmt.Fprint(d.out, "\033[?25h") // show cursor again
+				return
+			case now := <-ticker.C:
+				d.sample(now)
+				d.draw(now)
+			}
+		}
+	}()
+}
+
+// stop draws a final frame, restores the cursor and waits for the redraw
+// goroutine to exit. Safe to call more than once.
+func (d *dashboard) stop() {
+	d.stop_once.Do(func() { close(d.stop_ch) })
+	<-d.done_ch
 }

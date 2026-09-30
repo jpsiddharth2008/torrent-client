@@ -56,6 +56,7 @@ func (p *piece_state) snapshot() bitfield {
 type stats struct {
 	downloaded   atomic.Int64
 	uploaded     atomic.Int64
-	active_peers atomic.Int32
+	active_peers atomic.Int32 // workers connected to a peer right now
+	known_peers  atomic.Int32 // peers in the latest tracker response
 	started      time.Time
 }
