@@ -25,6 +25,13 @@ func open_storage(path string, length, piece_length int) (*storage, error) {
 		return nil, fmt.Errorf("failed to stat file: %w", err)
 	}
 
+	// a non-empty file of another size is not a download of this torrent;
+	// resizing it would silently destroy whatever it is
+	if stat.Size() != 0 && stat.Size() != int64(length) {
+		f.Close()
+		return nil, fmt.Errorf("%s already exists with size %d, expected %d; refusing to overwrite it", path, stat.Size(), length)
+	}
+
 	if stat.Size() != int64(length) {
 		if err := f.Truncate(int64(length)); err != nil {
 			f.Close()

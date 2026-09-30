@@ -171,17 +171,26 @@ func (t *torrent_file) request_peers(peer_id [20]byte, port uint16, left int) ([
 	}
 	defer response.Body.Close()
 
-	body, err := io.ReadAll(response.Body)
+	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 	if err != nil {
 		return nil, err
 	}
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("tracker returned HTTP %d", response.StatusCode)
+	}
 
 	var tracker_resp struct {
-		Peers string `bencode:"peers"`
+		Failure string `bencode:"failure reason"`
+		Peers   string `bencode:"peers"`
 	}
 
 	if err := bencode.Unmarshal(bytes.NewReader(body), &tracker_resp); err != nil {
 		return nil, err
+	}
+	// a tracker reports errors (unregistered torrent, rate limit, ...) as a
+	// normal response with this key; without the check it looks like 0 peers
+	if tracker_resp.Failure != "" {
+		return nil, fmt.Errorf("tracker error: %s", tracker_resp.Failure)
 	}
 	return unmarshal_peers([]byte(tracker_resp.Peers))
 }

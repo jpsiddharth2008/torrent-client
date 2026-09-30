@@ -85,6 +85,10 @@ func read_handshake(conn net.Conn) (*handshake, error) {
 	}, nil
 }
 
+// largest message we accept: a piece message carries one 16 KB block, and a
+// bitfield for even a million-piece torrent is 128 KB, so 1 MB is generous
+const max_message_length = 1 << 20
+
 type message_id uint8
 
 const (
@@ -125,6 +129,11 @@ func read_message(conn net.Conn) (*message, error) {
 
 	if length == 0 {
 		return nil, nil
+	}
+	// the length comes straight from the peer; without a cap a single bogus
+	// prefix makes us allocate up to 4 GB
+	if length > max_message_length {
+		return nil, fmt.Errorf("message length %d exceeds limit %d", length, max_message_length)
 	}
 
 	msg_buf := make([]byte, length)

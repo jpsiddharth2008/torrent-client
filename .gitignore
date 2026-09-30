@@ -1,7 +1,9 @@
 torrent-client
+*.exe
 *.iso
 *.torrent
 *.state
 *.state.tmp
+*.log
 # test fixtures must be tracked
 !testdata/*.torrent
