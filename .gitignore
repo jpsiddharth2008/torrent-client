@@ -1,5 +1,7 @@
 torrent-client
 *.iso
 *.torrent
+*.state
+*.state.tmp
 # test fixtures must be tracked
 !testdata/*.torrent
