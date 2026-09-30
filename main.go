@@ -63,6 +63,15 @@ func main() {
 	saver := new_resume_saver(state_path(output_path), &tf, store, state)
 	st := &stats{started: time.Now()}
 
+	// serve verified pieces to other peers while we download (issue #9)
+	seeder, err := start_seeder(6881, &tf, store, state, st)
+	if err != nil {
+		log.Printf("seeding disabled, could not start listener: %v\n", err)
+	} else {
+		defer seeder.stop()
+		log.Println("seeding listener active on port 6881")
+	}
+
 	var ui *dashboard
 	if use_ui {
 		ui = new_dashboard(&tf, state, st, os.Stdout)
