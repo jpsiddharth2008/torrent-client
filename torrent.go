@@ -7,10 +7,12 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackpal/bencode-go"
@@ -193,6 +195,34 @@ func (t *torrent_file) request_peers(peer_id [20]byte, port uint16, left int) ([
 		return nil, fmt.Errorf("tracker error: %s", tracker_resp.Failure)
 	}
 	return unmarshal_peers([]byte(tracker_resp.Peers))
+}
+
+// parse_peers turns a comma-separated list of host:port addresses (as given
+// to --peer) into peers. Hosts may be IPv4 addresses or names like localhost.
+func parse_peers(list string) ([]peer, error) {
+	var peers []peer
+	for _, addr := range strings.Split(list, ",") {
+		addr = strings.TrimSpace(addr)
+		if addr == "" {
+			continue
+		}
+		resolved, err := net.ResolveTCPAddr("tcp4", addr)
+		if err != nil {
+			return nil, fmt.Errorf("bad peer address %q: %w", addr, err)
+		}
+		ip := resolved.IP.To4()
+		if ip == nil || resolved.Port == 0 {
+			return nil, fmt.Errorf("bad peer address %q: need an IPv4 host and a port", addr)
+		}
+		var p peer
+		copy(p.ip[:], ip)
+		p.port = uint16(resolved.Port)
+		peers = append(peers, p)
+	}
+	if len(peers) == 0 {
+		return nil, fmt.Errorf("no peer addresses given")
+	}
+	return peers, nil
 }
 
 func new_peer_id() ([20]byte, error) {

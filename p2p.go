@@ -181,10 +181,27 @@ func start_download_worker(p peer, info_hash [20]byte, peer_id [20]byte, num_pie
 	}
 }
 
+// download_options configures where download finds peers and how it
+// identifies itself to them.
+type download_options struct {
+	peer_id [20]byte
+	port    uint16 // our listening port, announced to the tracker
+	peers   []peer // if set, connect only to these and never ask the tracker
+}
+
+// find_peers returns the fixed peer list if one was given, otherwise asks the
+// tracker.
+func (t *torrent_file) find_peers(opts download_options, state *piece_state) ([]peer, error) {
+	if len(opts.peers) > 0 {
+		return opts.peers, nil
+	}
+	return t.request_peers(opts.peer_id, opts.port, t.bytes_left(state))
+}
+
 // download fetches every piece not already marked done in state, writing each
 // verified piece to store. on_piece, if set, runs after a piece is on disk
 // and marked done.
-func (t *torrent_file) download(store *storage, state *piece_state, st *stats, on_piece func(index int)) error {
+func (t *torrent_file) download(store *storage, state *piece_state, st *stats, opts download_options, on_piece func(index int)) error {
 	num_pieces := len(t.piece_hashes)
 	done_pieces := state.count()
 	if done_pieces == num_pieces {
@@ -193,17 +210,13 @@ func (t *torrent_file) download(store *storage, state *piece_state, st *stats, o
 	}
 
 	log.Println("starting download for", t.name)
+	peer_id := opts.peer_id
 
-	peer_id, err := new_peer_id()
+	peers, err := t.find_peers(opts, state)
 	if err != nil {
 		return err
 	}
-
-	peers, err := t.request_peers(peer_id, 6881, t.bytes_left(state))
-	if err != nil {
-		return err
-	}
-	log.Printf("got %d peers from tracker\n", len(peers))
+	log.Printf("got %d peers\n", len(peers))
 	st.known_peers.Store(int32(len(peers)))
 
 	work_ch := make(chan *piece_work, num_pieces)
@@ -256,18 +269,18 @@ func (t *torrent_file) download(store *storage, state *piece_state, st *stats, o
 		case <-check.C:
 			// every worker has exited (peers disconnected, timed out or had
 			// nothing we need), so nothing will ever arrive on results_ch:
-			// ask the tracker for a fresh peer list instead of hanging
+			// get a fresh peer list (or redial --peer) instead of hanging
 			if running.Load() > 0 || time.Since(last_announce) < reannounce_delay {
 				continue
 			}
 			last_announce = time.Now()
 
-			peers, err := t.request_peers(peer_id, 6881, t.bytes_left(state))
+			peers, err := t.find_peers(opts, state)
 			if err != nil {
 				log.Printf("re-announce failed: %v\n", err)
 				continue
 			}
-			log.Printf("all peers gone, re-announced and got %d peers\n", len(peers))
+			log.Printf("all peers gone, reconnecting to %d peers\n", len(peers))
 			st.known_peers.Store(int32(len(peers)))
 			spawn(peers)
 		}
