@@ -15,12 +15,17 @@ func (bf bitfield) has_piece(index int) bool {
 	if byte_index < 0 || byte_index >= len(bf) {
 		return false
 	}
-	return bf[byte_index]>>uint(offset)&1 != 0
+	// bits run most-significant first, so piece n lives at bit 7-(n%8)
+	return bf[byte_index]>>uint(7-offset)&1 != 0
 }
 
 func (bf bitfield) set_piece(index int) {
 	byte_index := index / 8
 	offset := index % 8
+	// index comes from a peer's have message, so it may be out of range
+	if byte_index < 0 || byte_index >= len(bf) {
+		return
+	}
 	bf[byte_index] |= 1 << uint(7-offset)
 }
 
@@ -135,9 +140,9 @@ func read_message(conn net.Conn) (*message, error) {
 
 func format_request(index, begin, length int) *message {
 	payload := make([]byte, 12)
-	binary.LittleEndian.PutUint32(payload[0:4], uint32(index))
-	binary.LittleEndian.PutUint32(payload[4:8], uint32(begin))
-	binary.LittleEndian.PutUint32(payload[8:12], uint32(length))
+	binary.BigEndian.PutUint32(payload[0:4], uint32(index))
+	binary.BigEndian.PutUint32(payload[4:8], uint32(begin))
+	binary.BigEndian.PutUint32(payload[8:12], uint32(length))
 	return &message{
 		id:      msg_request,
 		payload: payload,

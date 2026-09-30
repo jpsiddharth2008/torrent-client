@@ -77,6 +77,8 @@ func (pp *piece_progress) handle_message(c *client) error {
 			return err
 		}
 		pp.downloaded += n
+		// the block landed, so free its slot for the next request
+		pp.backlog--
 	}
 
 	return nil
@@ -113,8 +115,10 @@ func check_integrity(pw *piece_work, data []byte) error {
 	return nil
 }
 
-func start_download_worker(p peer, info_hash [20]byte, peer_id [20]byte, work_ch chan *piece_work, results_ch chan *piece_result) {
-	c, err := new_client(p, info_hash, peer_id, len(work_ch))
+func start_download_worker(p peer, info_hash [20]byte, peer_id [20]byte, num_pieces int, work_ch chan *piece_work, results_ch chan *piece_result) {
+	// num_pieces is passed explicitly: len(work_ch) shrinks as work is claimed,
+	// which would undersize the bitfield of any late-connecting peer
+	c, err := new_client(p, info_hash, peer_id, num_pieces)
 	if err != nil {
 		log.Printf("could not connect to peer %s: %v\n", p, err)
 		return
@@ -177,7 +181,7 @@ func (t *torrent_file) download() ([]byte, error) {
 	}
 
 	for _, p := range peers {
-		go start_download_worker(p, t.info_hash, peer_id, work_ch, results_ch)
+		go start_download_worker(p, t.info_hash, peer_id, len(t.piece_hashes), work_ch, results_ch)
 	}
 
 	buf := make([]byte, t.length)
