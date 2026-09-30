@@ -5,8 +5,21 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"net"
 	"sync"
+	"time"
+)
+
+const (
+	// a peer must finish its handshake within this long
+	seed_handshake_timeout = 10 * time.Second
+	// peers send a keep-alive at least every 2 minutes; silence beyond that
+	// means the connection is dead
+	seed_idle_timeout = 3 * time.Minute
+	// 16 KB is the standard block size; a few clients ask for up to 128 KB,
+	// anything larger is abuse
+	max_request_length = 128 * 1024
 )
 
 type seeder struct {
@@ -18,6 +31,9 @@ type seeder struct {
 	peer_id  [20]byte
 	quit     chan struct{}
 	wg       sync.WaitGroup
+
+	mu    sync.Mutex
+	conns map[net.Conn]struct{} // open peer connections, closed by stop
 }
 
 func start_seeder(port int, tf *torrent_file, store *storage, state *piece_state, st *stats) (*seeder, error) {
@@ -38,6 +54,7 @@ func start_seeder(port int, tf *torrent_file, store *storage, state *piece_state
 		st:       st,
 		peer_id:  pid,
 		quit:     make(chan struct{}),
+		conns:    make(map[net.Conn]struct{}),
 	}
 
 	s.wg.Add(1)
@@ -46,10 +63,41 @@ func start_seeder(port int, tf *torrent_file, store *storage, state *piece_state
 	return s, nil
 }
 
+// stop closes the listener and every open peer connection, then waits for
+// all handlers to return. Handlers block in read_message, so without closing
+// their connections a single idle peer would make stop hang forever.
 func (s *seeder) stop() {
 	close(s.quit)
 	s.listener.Close()
+
+	s.mu.Lock()
+	for c := range s.conns {
+		c.Close()
+	}
+	s.mu.Unlock()
+
 	s.wg.Wait()
+}
+
+// track registers a connection so stop can close it. It reports false if the
+// seeder is already stopping, in which case the caller must drop the conn.
+func (s *seeder) track(c net.Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	select {
+	case <-s.quit:
+		return false
+	default:
+	}
+	s.conns[c] = struct{}{}
+	return true
+}
+
+func (s *seeder) untrack(c net.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.conns, c)
 }
 
 func (s *seeder) accept_loop() {
@@ -61,13 +109,22 @@ func (s *seeder) accept_loop() {
 			case <-s.quit:
 				return
 			default:
-				continue
 			}
+			// e.g. out of file descriptors: back off instead of spinning
+			log.Printf("seeder: accept failed: %v\n", err)
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		if !s.track(conn) {
+			conn.Close()
+			return
 		}
 
 		s.wg.Add(1)
 		go func(c net.Conn) {
 			defer s.wg.Done()
+			defer s.untrack(c)
 			defer c.Close()
 			s.handle_peer(c)
 		}(conn)
@@ -75,12 +132,17 @@ func (s *seeder) accept_loop() {
 }
 
 func (s *seeder) handle_peer(conn net.Conn) {
-	// 1. Handshake exchange
+	// 1. Handshake exchange, bounded so a silent peer can't hold us forever
+	conn.SetDeadline(time.Now().Add(seed_handshake_timeout))
+
 	hs, err := read_handshake(conn)
 	if err != nil {
 		return
 	}
 
+	if hs.pstr != "BitTorrent protocol" {
+		return // not a BitTorrent peer
+	}
 	if !bytes.Equal(hs.info_hash[:], s.tf.info_hash[:]) {
 		return // Info-hash mismatch
 	}
@@ -114,6 +176,8 @@ func (s *seeder) handle_peer(conn net.Conn) {
 
 	// 4. Message loop handling incoming request messages
 	for {
+		conn.SetDeadline(time.Now().Add(seed_idle_timeout))
+
 		msg, err := read_message(conn)
 		if err != nil {
 			return
@@ -124,12 +188,23 @@ func (s *seeder) handle_peer(conn net.Conn) {
 
 		switch msg.id {
 		case msg_request:
-			if len(msg.payload) < 12 {
+			if len(msg.payload) != 12 {
 				return
 			}
 			index := int(binary.BigEndian.Uint32(msg.payload[0:4]))
 			begin := int(binary.BigEndian.Uint32(msg.payload[4:8]))
 			length := int(binary.BigEndian.Uint32(msg.payload[8:12]))
+
+			if length <= 0 || length > max_request_length {
+				return // misbehaving peer
+			}
+			// never upload a piece we haven't verified: while downloading, the
+			// file holds zeros and half-written pieces we must not spread.
+			// Peers learn what we have from our bitfield, so a request for
+			// anything else is ignored rather than answered with bad data.
+			if !s.state.has(index) {
+				continue
+			}
 
 			block, err := s.store.read_block(index, begin, length)
 			if err != nil {
