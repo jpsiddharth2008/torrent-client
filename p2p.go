@@ -154,24 +154,38 @@ func start_download_worker(p peer, info_hash [20]byte, peer_id [20]byte, work_ch
 	}
 }
 
-func (t *torrent_file) download() ([]byte, error) {
+// download fetches every piece not already marked done in state, writing each
+// verified piece to store. on_piece, if set, runs after a piece is on disk
+// and marked done.
+func (t *torrent_file) download(store *storage, state *piece_state, on_piece func(index int)) error {
+	num_pieces := len(t.piece_hashes)
+	done_pieces := state.count()
+	if done_pieces == num_pieces {
+		log.Printf("all %d pieces already verified on disk, nothing to download\n", num_pieces)
+		return nil
+	}
+
 	log.Println("starting download for", t.name)
 
 	peer_id, err := new_peer_id()
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	peers, err := t.request_peers(peer_id, 6881)
+	peers, err := t.request_peers(peer_id, 6881, t.bytes_left(state))
 	if err != nil {
-		return nil, err
+		return err
 	}
 	log.Printf("got %d peers from tracker\n", len(peers))
 
-	work_ch := make(chan *piece_work, len(t.piece_hashes))
+	work_ch := make(chan *piece_work, num_pieces)
 	results_ch := make(chan *piece_result)
 
 	for index, hash := range t.piece_hashes {
+		// already verified on disk by an earlier run
+		if state.has(index) {
+			continue
+		}
 		length := t.piece_length_at(index)
 		work_ch <- &piece_work{index, hash, length}
 	}
@@ -180,24 +194,28 @@ func (t *torrent_file) download() ([]byte, error) {
 		go start_download_worker(p, t.info_hash, peer_id, work_ch, results_ch)
 	}
 
-	buf := make([]byte, t.length)
-	done_pieces := 0
-
-	for done_pieces < len(t.piece_hashes) {
+	for done_pieces < num_pieces {
 		result := <-results_ch
 
-		begin := result.index * t.piece_length
-		end := begin + len(result.data)
-		copy(buf[begin:end], result.data)
+		if err := store.write_piece(result.index, result.data); err != nil {
+			return err
+		}
+		// mark done only once the data is written, so the saved state
+		// never claims a piece that is not on disk
+		state.mark_done(result.index)
+		if on_piece != nil {
+			on_piece(result.index)
+		}
 		done_pieces++
 
-		percent := float64(done_pieces) / float64(len(t.piece_hashes)) * 100
+		percent := float64(done_pieces) / float64(num_pieces) * 100
 		num_workers := runtime.NumGoroutine() - 1
 		log.Printf("%.2f%% done — piece %d downloaded, %d peers active\n", percent, result.index, num_workers)
 	}
-	close(work_ch)
+	// work_ch is deliberately left open: a worker may still hand back a piece
+	// it was holding, and a send on a closed channel would panic
 
-	return buf, nil
+	return nil
 }
 
 func (t *torrent_file) piece_length_at(index int) int {

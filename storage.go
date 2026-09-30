@@ -109,6 +109,13 @@ func (s *storage) read_block(index, begin, length int) ([]byte, error) {
 	return buf, nil
 }
 
+// sync flushes written pieces from the OS cache to the disk.
+func (s *storage) sync() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.f.Sync()
+}
+
 func (s *storage) close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
